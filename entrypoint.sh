@@ -31,6 +31,20 @@ ask() {  # ask VAR "question" default
 
 setup() {
   mkdir -p "$DATA"
+  if [ -f "$CONF" ] || [ -f "$KEY" ]; then
+    local state="NOT finished" choice
+    grep -q '^BIND_IP=.' "$CONF" 2>/dev/null && state="finished"
+    echo "A previous setup was found ($state)."
+    ask choice "Resume with the saved answers and SSH key (r) or start from scratch (s)?" r
+    case "$choice" in
+      r|R) ;;
+      s|S)
+        rm -f "$CONF" "$KEY" "$KEY.pub" "$DATA/known_hosts" "$DATA/remote-bootstrap.sh"
+        echo "Cleared. A new SSH key will be generated: remove the old one from authorized_keys on the VPS." ;;
+      *) die "answer r or s" ;;
+    esac
+    echo
+  fi
   [ -f "$CONF" ] && . "$CONF"
 
   echo "== Step 1: VPS connection =="
@@ -41,6 +55,8 @@ setup() {
   [[ "$VPS_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] || die "invalid user name"
   [ "$VPS_USER" != root ] || die "root is not allowed, use a normal user"
   [[ "$VPS_PORT" =~ ^[0-9]+$ ]] || die "invalid port"
+  # saved now so a re-run after an interrupted setup pre-fills the answers
+  printf 'VPS_HOST=%s\nVPS_USER=%s\nVPS_PORT=%s\n' "$VPS_HOST" "$VPS_USER" "$VPS_PORT" > "$CONF"
 
   echo; echo "== Step 2: SSH key =="
   if [ ! -f "$KEY" ]; then
@@ -93,8 +109,8 @@ EOF
 }
 
 run() {
-  [ -f "$CONF" ] || die "not configured, run: docker run -it --rm -v /opt/hermes-local-proxy:/data hermes-local-proxy setup"
-  . "$CONF"
+  [ -f "$CONF" ] && . "$CONF"
+  [ -n "${BIND_IP:-}" ] || die "setup not finished, run: docker run -it --rm -v /opt/hermes-local-proxy:/data hermes-local-proxy setup"
   trap 'kill 0 2>/dev/null; exit 0' TERM INT
 
   hermes_prompt
