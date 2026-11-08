@@ -1,0 +1,119 @@
+bash <<'HERMES_PROXY_BOOTSTRAP'
+# hermes-local-proxy: one-time root setup on the VPS. Safe to re-run.
+set -euo pipefail
+SSH_USER="__SSH_USER__"
+PORT_FIRST=__PORT_FIRST__
+PORT_LAST=__PORT_LAST__
+RELAY_NAME=hermes-proxy-relay
+RELAY_DIR=/opt/hermes-proxy-relay
+SSHD_CONF=/etc/ssh/sshd_config
+
+[ "$(id -u)" = 0 ] || { echo "ERROR: run this as root"; exit 1; }
+id "$SSH_USER" >/dev/null || { echo "ERROR: user $SSH_USER does not exist"; exit 1; }
+command -v sudo >/dev/null || { echo "ERROR: install sudo first (apt install sudo)"; exit 1; }
+
+# 1. Find Hermes and its Docker network (override with: export HERMES_CONTAINER=... HERMES_NETWORK=...)
+HERMES_CONTAINER="${HERMES_CONTAINER:-$(docker ps --format '{{.Names}}' | grep -i hermes | grep -vx "$RELAY_NAME" | head -n1 || true)}"
+[ -n "$HERMES_CONTAINER" ] || { echo "ERROR: no running container with 'hermes' in its name. Run: export HERMES_CONTAINER=<name>, then paste again."; exit 1; }
+HERMES_NETWORK="${HERMES_NETWORK:-$(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{println $k}}{{end}}' "$HERMES_CONTAINER" | head -n1)}"
+case "$HERMES_NETWORK" in
+  host|none|"") echo "ERROR: Hermes network '$HERMES_NETWORK' is not supported, it must be a bridge/compose network"; exit 1 ;;
+esac
+HERMES_SUBNET="$(docker network inspect "$HERMES_NETWORK" -f '{{range .IPAM.Config}}{{println .Subnet}}{{end}}' | head -n1)"
+BIND_IP="$(docker network inspect bridge -f '{{range .IPAM.Config}}{{println .Gateway}}{{end}}' | head -n1)"
+[ -n "$BIND_IP" ] || BIND_IP="$(ip -4 -o addr show docker0 | awk '{split($4, a, "/"); print a[1]}')"
+[ -n "$BIND_IP" ] || { echo "ERROR: cannot find the docker0 bridge IP"; exit 1; }
+echo "Hermes container: $HERMES_CONTAINER, network: $HERMES_NETWORK ($HERMES_SUBNET), tunnel bind IP: $BIND_IP"
+
+# 2. Relay container (gost) on the Hermes network (not published on any host port).
+#    hash: host keeps each site on one tunnel; retries skips dead tunnels within the same request;
+#    connector timeout drops tunnels that accept but never answer (stale SSH sessions).
+mkdir -p "$RELAY_DIR"
+{
+  cat <<EOF
+services:
+- name: relay
+  addr: ":1080"
+  handler: {type: socks5, chain: tunnels, retries: $((PORT_LAST - PORT_FIRST)), metadata: {hash: host}}
+  listener: {type: tcp}
+chains:
+- name: tunnels
+  hops:
+  - name: home
+    selector: {strategy: hash, maxFails: 1, failTimeout: 30s}
+    nodes:
+EOF
+  for p in $(seq "$PORT_FIRST" "$PORT_LAST"); do
+    echo "    - {name: tunnel-$p, addr: \"$BIND_IP:$p\", connector: {type: socks5, metadata: {timeout: 10s}}, dialer: {type: tcp}}"
+  done
+  echo "log: {level: info, format: text, output: stdout}"
+} > "$RELAY_DIR/gost.yaml"
+chmod 644 "$RELAY_DIR/gost.yaml"
+docker rm -f "$RELAY_NAME" >/dev/null 2>&1 || true
+docker run -d --name "$RELAY_NAME" --restart always --network "$HERMES_NETWORK" \
+  -v "$RELAY_DIR/gost.yaml:/etc/gost.yaml:ro" \
+  --log-opt max-size=10m --log-opt max-file=3 \
+  gogost/gost:3.3.3 -C /etc/gost.yaml >/dev/null
+echo "Relay container $RELAY_NAME started"
+
+# 3. sshd: let $SSH_USER bind reverse tunnels ONLY on $BIND_IP:$PORT_FIRST-$PORT_LAST (never public)
+LISTEN=""
+for p in $(seq "$PORT_FIRST" "$PORT_LAST"); do LISTEN="$LISTEN $BIND_IP:$p"; done
+[ -f "$SSHD_CONF.hermes-proxy.bak" ] || cp "$SSHD_CONF" "$SSHD_CONF.hermes-proxy.bak"
+cp "$SSHD_CONF" "$SSHD_CONF.hermes-proxy.prev"
+sed -i "/^# hermes-proxy begin $SSH_USER\$/,/^# hermes-proxy end $SSH_USER\$/d" "$SSHD_CONF"
+cat >> "$SSHD_CONF" <<EOF
+# hermes-proxy begin $SSH_USER
+Match User $SSH_USER
+    GatewayPorts clientspecified
+    PermitListen$LISTEN
+    ClientAliveInterval 15
+    ClientAliveCountMax 3
+# hermes-proxy end $SSH_USER
+EOF
+if ! "$(command -v sshd || echo /usr/sbin/sshd)" -t; then
+  cp "$SSHD_CONF.hermes-proxy.prev" "$SSHD_CONF"
+  echo "ERROR: sshd config test failed, restored previous config"; exit 1
+fi
+systemctl reload ssh 2>/dev/null || systemctl reload sshd
+echo "sshd reloaded"
+
+# 4. Firewall: if ufw is active, allow only the Hermes network to reach the tunnel ports
+if command -v ufw >/dev/null && ufw status | grep -q '^Status: active'; then
+  ufw allow in from "$HERMES_SUBNET" to "$BIND_IP" port "$PORT_FIRST:$PORT_LAST" proto tcp comment hermes-proxy >/dev/null
+  echo "ufw rule added for $HERMES_SUBNET"
+fi
+
+# 5. Read-only status helper, root-owned in a root-owned dir, runnable by $SSH_USER via sudo with no arguments
+cat > /etc/hermes-proxy.conf <<EOF
+BIND_IP=$BIND_IP
+PORT_FIRST=$PORT_FIRST
+PORT_LAST=$PORT_LAST
+HERMES_CONTAINER=$HERMES_CONTAINER
+HERMES_NETWORK=$HERMES_NETWORK
+EOF
+chmod 644 /etc/hermes-proxy.conf
+cat > /usr/local/bin/hermes-proxy-info <<'INFO_EOF'
+#!/bin/sh
+# Read-only status for hermes-local-proxy (installed by root, run as: sudo hermes-proxy-info)
+. /etc/hermes-proxy.conf
+echo "BIND_IP=$BIND_IP"
+echo "PORT_FIRST=$PORT_FIRST"
+echo "PORT_LAST=$PORT_LAST"
+echo "HERMES_CONTAINER=$HERMES_CONTAINER"
+echo "HERMES_STATUS=$(docker inspect -f '{{.State.Status}}' "$HERMES_CONTAINER" 2>/dev/null || echo missing)"
+echo "HERMES_NETWORK=$HERMES_NETWORK"
+echo "RELAY_STATUS=$(docker inspect -f '{{.State.Status}}' hermes-proxy-relay 2>/dev/null || echo missing)"
+echo "RELAY_ON_HERMES_NETWORK=$(docker inspect -f "{{if index .NetworkSettings.Networks \"$HERMES_NETWORK\"}}yes{{else}}no{{end}}" hermes-proxy-relay 2>/dev/null || echo no)"
+echo "--- last relay log lines ---"
+docker logs --tail 20 hermes-proxy-relay 2>&1
+INFO_EOF
+chown root:root /usr/local/bin/hermes-proxy-info
+chmod 755 /usr/local/bin/hermes-proxy-info
+echo "$SSH_USER ALL=(root) NOPASSWD: /usr/local/bin/hermes-proxy-info \"\"" > /etc/sudoers.d/hermes-proxy
+chmod 440 /etc/sudoers.d/hermes-proxy
+visudo -cf /etc/sudoers.d/hermes-proxy >/dev/null || { rm -f /etc/sudoers.d/hermes-proxy; echo "ERROR: invalid sudoers entry"; exit 1; }
+
+echo
+echo "DONE. Go back to the setup wizard and press Enter."
+HERMES_PROXY_BOOTSTRAP
