@@ -89,7 +89,8 @@ setup() {
     || die "cannot run 'sudo hermes-proxy-info' on the VPS, did the root script finish?"
   echo "$info" | sed '/^--- last relay log lines ---$/q'
   BIND_IP=$(sed -n 's/^BIND_IP=//p' <<<"$info")
-  [ -n "$BIND_IP" ] || die "no BIND_IP from the VPS"
+  # config.env is sourced as shell: never write a value from the VPS without validating it
+  [[ "$BIND_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || die "invalid BIND_IP from the VPS: '$BIND_IP'"
   grep -qx 'RELAY_STATUS=running' <<<"$info" || die "relay container is not running on the VPS"
   grep -qx 'RELAY_ON_HERMES_NETWORK=yes' <<<"$info" || die "relay is not on the Hermes network"
 
@@ -103,9 +104,34 @@ EOF
 
   echo; echo "== Setup complete =="
   echo "Start the proxy (restarts on boot):"
-  echo "  docker run -d --name hermes-local-proxy --restart always -v /opt/hermes-local-proxy:/data hermes-local-proxy"
+  echo "  docker run -d --name hermes-local-proxy --restart always --cap-add NET_ADMIN -v /opt/hermes-local-proxy:/data hermes-local-proxy"
   echo
   hermes_prompt
+}
+
+PRIVATE_V4="0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.168.0.0/16 224.0.0.0/4 240.0.0.0/4"
+PRIVATE_V6="::/128 fc00::/7 fe80::/10 ff00::/8 ::ffff:0:0/96"
+
+# Proxied traffic must never reach the home LAN or this machine; the filter runs after DNS
+# resolution, so names pointing at private IPs are blocked too. Only the VPS SSH port and
+# the DNS servers are allowed through.
+lock_egress() {
+  local ip ns net
+  iptables -F OUTPUT 2>/dev/null || die "cannot set firewall rules: start the container with --cap-add NET_ADMIN"
+  iptables -A OUTPUT -o lo -j ACCEPT
+  for ip in $(getent ahostsv4 "$VPS_HOST" | awk '{print $1}' | sort -u); do
+    iptables -A OUTPUT -d "$ip" -p tcp --dport "$VPS_PORT" -j ACCEPT
+  done
+  for ns in $(awk '$1 == "nameserver" && $2 ~ /^[0-9.]+$/ {print $2}' /etc/resolv.conf); do
+    iptables -A OUTPUT -d "$ns" -p udp --dport 53 -j ACCEPT
+    iptables -A OUTPUT -d "$ns" -p tcp --dport 53 -j ACCEPT
+  done
+  for net in $PRIVATE_V4; do iptables -A OUTPUT -d "$net" -j REJECT; done
+  if ip -6 addr show scope global 2>/dev/null | grep -q inet6; then
+    ip6tables -F OUTPUT && ip6tables -A OUTPUT -o lo -j ACCEPT || die "cannot set IPv6 firewall rules"
+    for net in $PRIVATE_V6; do ip6tables -A OUTPUT -d "$net" -j REJECT; done
+  fi
+  log "egress: private and LAN destinations blocked"
 }
 
 run() {
@@ -113,6 +139,7 @@ run() {
   [ -n "${BIND_IP:-}" ] || die "setup not finished, run: docker run -it --rm -v /opt/hermes-local-proxy:/data hermes-local-proxy setup"
   trap 'kill 0 2>/dev/null; exit 0' TERM INT
 
+  lock_egress
   hermes_prompt
 
   (while true; do microsocks -i 127.0.0.1 -p "$SOCKS_PORT"; log "microsocks exited, restarting"; sleep 1; done) &

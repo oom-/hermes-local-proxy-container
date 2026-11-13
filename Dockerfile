@@ -6,7 +6,7 @@ RUN apk add --no-cache build-base \
  && install -m 755 microsocks-${MICROSOCKS_VERSION}/microsocks /usr/local/bin/microsocks
 
 FROM alpine:3.20
-RUN apk add --no-cache bash openssh-client
+RUN apk add --no-cache bash openssh-client iptables ip6tables
 COPY --from=microsocks /usr/local/bin/microsocks /usr/local/bin/microsocks
 COPY entrypoint.sh README.md remote/bootstrap.sh.tmpl /app/
 RUN chmod +x /app/entrypoint.sh

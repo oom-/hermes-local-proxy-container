@@ -65,8 +65,11 @@ the root shell before pasting (and `HERMES_NETWORK=<network>` if it is on severa
 ### 3. Start the proxy
 
 ```bash
-docker run -d --name hermes-local-proxy --restart always -v /opt/hermes-local-proxy:/data hermes-local-proxy
+docker run -d --name hermes-local-proxy --restart always --cap-add NET_ADMIN -v /opt/hermes-local-proxy:/data hermes-local-proxy
 ```
+
+`--cap-add NET_ADMIN` is required: the container firewalls itself so the proxy can never reach
+your home network (see [Security notes](#security-notes)). It refuses to start without it.
 
 `--restart always` brings it back after a reboot (as long as Docker starts at boot). It reconnects
 forever with backoff (1s up to 60s) when the network or the VPS drops.
@@ -143,6 +146,12 @@ plain `docker run --network`.
 - The helper lives in `/usr/local/bin`, not in the user's home: a user can delete and replace any
   file in a directory they own, so a root-run script in their home would be a root escalation.
   It only prints fixed status fields (not `docker inspect` output, which contains env secrets).
+- **Home network isolation.** A SOCKS proxy at home could otherwise be used to reach your router,
+  NAS or the home machine itself (for example if a web page tricks Hermes into opening
+  `http://192.168.1.1`). On start, the home container blocks all outgoing traffic to private,
+  loopback, link-local and CGNAT ranges (IPv4 and IPv6) with iptables. The filter applies after
+  DNS resolution, so a public name pointing at a private IP is blocked too. Only the VPS SSH port
+  and the container's DNS servers are exempt.
 - Any container on Hermes's network can use the relay (no auth). The relay is not published on
   the host.
 - Everything Hermes fetches leaves from your home IP. Watch the relay log:
